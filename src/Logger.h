@@ -52,21 +52,58 @@ namespace f4cf::logger::internal
     inline int _logLevel = -1;
 
     /**
+     * Default log pattern: full date, bracketed level and the logging class (see ClassNameFlag).
+     * Used when the config gives no pattern or an empty one.
+     */
+    inline constexpr auto DEFAULT_LOG_PATTERN = "%Y-%m-%d %H:%M:%S.%e [%l] [%-20!k] %v";
+
+    /**
      * Current global log pattern
      */
-    inline std::string _logPattern = "%H:%M:%S.%e %l [%-20!k] %v";
+    inline std::string _logPattern = DEFAULT_LOG_PATTERN;
 
     /**
      * Holds the last time of a log message per key.
      */
     inline std::unordered_map<std::string_view, std::chrono::steady_clock::time_point> _sampleMessagesTtl;
 
+    constexpr int clampLogLevel(const int logLevel)
+    {
+        return std::clamp(logLevel, static_cast<int>(spdlog::level::trace), static_cast<int>(spdlog::level::off));
+    }
+
+    constexpr const char* logLevelName(const int logLevel)
+    {
+        switch (static_cast<spdlog::level::level_enum>(clampLogLevel(logLevel))) {
+        case spdlog::level::trace:
+            return "trace";
+        case spdlog::level::debug:
+            return "debug";
+        case spdlog::level::info:
+            return "info";
+        case spdlog::level::warn:
+            return "warn";
+        case spdlog::level::err:
+            return "error";
+        case spdlog::level::critical:
+            return "critical";
+        case spdlog::level::off:
+            return "off";
+        default:
+            return "unknown";
+        }
+    }
+
     /**
-     * Same as calling _MESSAGE but only one message log per "time" second, other logs are dropped.
+     * Logs at "level" but only one message per "time" milliseconds per format string, other logs are dropped.
      */
     template <class... Args>
-    void sampleImpl(const int time, const std::source_location& loc, spdlog::format_string_t<Args...> fmt, Args&&... args)
+    void sampleImpl(const spdlog::level::level_enum level, const int time, const std::source_location& loc, spdlog::format_string_t<Args...> fmt, Args&&... args)
     {
+        if (!_logger || !_logger->should_log(level)) {
+            return;
+        }
+
         const fmt::basic_string_view<char> fmtView = fmt;
         const std::string_view key(fmtView.data(), fmtView.size());
 
@@ -78,7 +115,7 @@ namespace f4cf::logger::internal
         _sampleMessagesTtl[key] = now;
         std::string formatted = fmt::format(fmt, std::forward<Args>(args)...);
         const spdlog::source_loc sourceLoc{ loc.file_name(), static_cast<int>(loc.line()), loc.function_name() };
-        _logger->log(sourceLoc, spdlog::level::info, "[SAMPLE] {}", formatted);
+        _logger->log(sourceLoc, level, "[sample] {}", formatted);
     }
 
     /**
@@ -203,6 +240,21 @@ namespace f4cf::logger
         return internal::_logger && internal::_logger->should_log(spdlog::level::info);
     }
 
+    inline bool isWarnEnabled()
+    {
+        return internal::_logger && internal::_logger->should_log(spdlog::level::warn);
+    }
+
+    inline bool isErrorEnabled()
+    {
+        return internal::_logger && internal::_logger->should_log(spdlog::level::err);
+    }
+
+    inline bool isCriticalEnabled()
+    {
+        return internal::_logger && internal::_logger->should_log(spdlog::level::critical);
+    }
+
     /**
      * Same as calling info() but only one message log per "time" in milliseconds, other logs are dropped.
      * Use the message format as a key to identify the log messages that should be sampled.
@@ -219,12 +271,12 @@ namespace f4cf::logger
 
         explicit sample(spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
         {
-            internal::sampleImpl(1000, loc, fmt, std::forward<Args>(args)...);
+            internal::sampleImpl(spdlog::level::info, 1000, loc, fmt, std::forward<Args>(args)...);
         }
 
         explicit sample(const int time, spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
         {
-            internal::sampleImpl(time, loc, fmt, std::forward<Args>(args)...);
+            internal::sampleImpl(spdlog::level::info, time, loc, fmt, std::forward<Args>(args)...);
         }
     };
 
@@ -235,7 +287,7 @@ namespace f4cf::logger
     sample(int, spdlog::format_string_t<Args...>, Args&&...) -> sample<Args...>;
 
     /**
-     * Same as sample() but only logs when the debug log level is enabled.
+     * Same as sample() but logged at the debug level, so only when it is enabled.
      */
     template <class... Args>
     struct [[maybe_unused]] sampleDebug
@@ -244,16 +296,12 @@ namespace f4cf::logger
 
         explicit sampleDebug(spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
         {
-            if (isDebugEnabled()) {
-                internal::sampleImpl(1000, loc, fmt, std::forward<Args>(args)...);
-            }
+            internal::sampleImpl(spdlog::level::debug, 1000, loc, fmt, std::forward<Args>(args)...);
         }
 
         explicit sampleDebug(const int time, spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
         {
-            if (isDebugEnabled()) {
-                internal::sampleImpl(time, loc, fmt, std::forward<Args>(args)...);
-            }
+            internal::sampleImpl(spdlog::level::debug, time, loc, fmt, std::forward<Args>(args)...);
         }
     };
 
@@ -262,6 +310,31 @@ namespace f4cf::logger
 
     template <class... Args>
     sampleDebug(int, spdlog::format_string_t<Args...>, Args&&...) -> sampleDebug<Args...>;
+
+    /**
+     * Same as sample() but logged at the warn level.
+     */
+    template <class... Args>
+    struct [[maybe_unused]] sampleWarn
+    {
+        sampleWarn() = delete;
+
+        explicit sampleWarn(spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
+        {
+            internal::sampleImpl(spdlog::level::warn, 1000, loc, fmt, std::forward<Args>(args)...);
+        }
+
+        explicit sampleWarn(const int time, spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())
+        {
+            internal::sampleImpl(spdlog::level::warn, time, loc, fmt, std::forward<Args>(args)...);
+        }
+    };
+
+    template <class... Args>
+    sampleWarn(spdlog::format_string_t<Args...>, Args&&...) -> sampleWarn<Args...>;
+
+    template <class... Args>
+    sampleWarn(int, spdlog::format_string_t<Args...>, Args&&...) -> sampleWarn<Args...>;
 
     template <class... Args>
     void infoRaw(spdlog::format_string_t<Args...> fmt, Args&&... args)
@@ -301,18 +374,22 @@ namespace f4cf::logger
      */
     inline void setLogLevelAndPattern(int logLevel, const std::string& logPattern)
     {
-        if (internal::_logLevel != logLevel) {
-            info("Set log level = {}", logLevel);
-            internal::_logLevel = logLevel;
-            const auto levelEnum = static_cast<spdlog::level::level_enum>(logLevel);
+        const int clampedLogLevel = internal::clampLogLevel(logLevel);
+        if (internal::_logLevel != clampedLogLevel) {
+            info("Set log level = {} ({})", clampedLogLevel, internal::logLevelName(clampedLogLevel));
+            internal::_logLevel = clampedLogLevel;
+            const auto levelEnum = static_cast<spdlog::level::level_enum>(clampedLogLevel);
             internal::_logger->set_level(levelEnum);
             internal::_logger->flush_on(levelEnum);
+            internal::_rawLogger->set_level(levelEnum);
+            internal::_rawLogger->flush_on(levelEnum);
         }
 
         // see: https://github.com/gabime/spdlog/wiki/Custom-formatting
-        if (internal::_logPattern != logPattern) {
-            info("Set log pattern = {}", logPattern);
-            internal::_logPattern = logPattern;
+        const std::string normalizedPattern = logPattern.empty() ? std::string(internal::DEFAULT_LOG_PATTERN) : logPattern;
+        if (internal::_logPattern != normalizedPattern) {
+            info("Set log pattern = {}", normalizedPattern);
+            internal::_logPattern = normalizedPattern;
             spdlog::set_formatter(std::make_unique<internal::HybridFormatter>());
         }
     }

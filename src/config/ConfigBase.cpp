@@ -200,7 +200,7 @@ namespace f4cf
         const auto section = config[CONFIG_SECTION_DEBUG];
         _configVersion = config[config::VERSION_SECTION][config::VERSION_KEY].value_or(0);
         _logLevel = section["iLogLevel"].value_or(2);
-        _logPattern = section["sLogPattern"].value_or(std::string("%H:%M:%S.%e %l [%-20!k] %v"));
+        _logPattern = section["sLogPattern"].value_or(std::string(logger::internal::DEFAULT_LOG_PATTERN));
         debug.load(config);
     }
 
