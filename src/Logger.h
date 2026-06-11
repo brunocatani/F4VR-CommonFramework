@@ -4,30 +4,41 @@
 // ReSharper disable CppClangTidyBugproneMacroParentheses
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <source_location>
 #include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/rotating_file_sink.h>
-#include <unordered_map>
+#include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
 #pragma once
 
-#define MAKE_SOURCE_LOGGER(log_func, log_level)                                                                                                    \
-                                                                                                                                                   \
-    template <class... Args>                                                                                                                       \
-    struct [[maybe_unused]] log_func                                                                                                               \
-    {                                                                                                                                              \
-        log_func() = delete;                                                                                                                       \
-                                                                                                                                                   \
-        explicit log_func(spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current()) \
-        {                                                                                                                                          \
-            spdlog::source_loc sourceLoc{ loc.file_name(), static_cast<int>(loc.line()), loc.function_name() };                                    \
-            internal::_logger->log(sourceLoc, spdlog::level::log_level, fmt, std::forward<Args>(args)...);                                         \
-        }                                                                                                                                          \
-    };                                                                                                                                             \
-                                                                                                                                                   \
-    template <class... Args>                                                                                                                       \
+#define MAKE_SOURCE_LOGGER(log_func, log_level)                                                                                                       \
+                                                                                                                                                      \
+    template <class... Args>                                                                                                                          \
+    struct [[maybe_unused]] log_func                                                                                                                  \
+    {                                                                                                                                                 \
+        log_func() = delete;                                                                                                                          \
+                                                                                                                                                      \
+        explicit log_func(spdlog::format_string_t<Args...> fmt, Args&&... args, const std::source_location& loc = std::source_location::current())    \
+        {                                                                                                                                             \
+            constexpr auto level = spdlog::level::log_level;                                                                                         \
+            if (!internal::_logger || !internal::_logger->should_log(level)) {                                                                        \
+                return;                                                                                                                               \
+            }                                                                                                                                         \
+            spdlog::source_loc sourceLoc{ loc.file_name(), static_cast<int>(loc.line()), loc.function_name() };                                      \
+            internal::_logger->log(sourceLoc, level, fmt, std::forward<Args>(args)...);                                                               \
+        }                                                                                                                                             \
+    };                                                                                                                                                \
+                                                                                                                                                      \
+    template <class... Args>                                                                                                                          \
     log_func(spdlog::format_string_t<Args...>, Args&&...) -> log_func<Args...>;
 
 namespace f4cf::logger::internal
@@ -62,10 +73,21 @@ namespace f4cf::logger::internal
      */
     inline std::string _logPattern = DEFAULT_LOG_PATTERN;
 
+    // Normal diagnostics are buffered; only errors/critical faults force an immediate disk flush.
+    inline constexpr auto FLUSH_ON_LEVEL = spdlog::level::err;
+    inline constexpr std::size_t SAMPLE_THROTTLE_SLOT_COUNT = 512;
+
+    struct SampleThrottleSlot
+    {
+        std::atomic<std::uint64_t> keyHash{ 0 };
+        std::atomic<std::int64_t> nextAllowedMs{ 0 };
+    };
+
     /**
-     * Holds the last time of a log message per key.
+     * Bounded sampled-log throttle state. Collisions may conservatively drop diagnostics,
+     * but logging must never allocate/grow a map or corrupt string-view keys in hot paths.
      */
-    inline std::unordered_map<std::string_view, std::chrono::steady_clock::time_point> _sampleMessagesTtl;
+    inline std::array<SampleThrottleSlot, SAMPLE_THROTTLE_SLOT_COUNT> _sampleThrottleSlots;
 
     constexpr int clampLogLevel(const int logLevel)
     {
@@ -94,6 +116,58 @@ namespace f4cf::logger::internal
         }
     }
 
+    inline std::uint64_t sampleKeyHash(const std::string_view key)
+    {
+        std::uint64_t hash = 14695981039346656037ull;
+        for (const unsigned char c : key) {
+            hash ^= c;
+            hash *= 1099511628211ull;
+        }
+        return hash == 0 ? 1 : hash;
+    }
+
+    inline std::int64_t steadyClockMilliseconds()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    inline bool shouldEmitSample(const std::string_view key, const int time)
+    {
+        const auto hash = sampleKeyHash(key);
+        auto& slot = _sampleThrottleSlots[hash % _sampleThrottleSlots.size()];
+        const auto nowMs = steadyClockMilliseconds();
+        const auto throttleMs = std::max<std::int64_t>(0, time);
+        const auto nextAllowedMs = nowMs + throttleMs;
+
+        const auto storedHash = slot.keyHash.load(std::memory_order_acquire);
+        if (storedHash != hash) {
+            if (storedHash != 0 && nowMs < slot.nextAllowedMs.load(std::memory_order_acquire)) {
+                return false;
+            }
+            slot.keyHash.store(hash, std::memory_order_release);
+            slot.nextAllowedMs.store(nextAllowedMs, std::memory_order_release);
+            return true;
+        }
+
+        auto observedNextMs = slot.nextAllowedMs.load(std::memory_order_acquire);
+        while (nowMs >= observedNextMs) {
+            if (slot.nextAllowedMs.compare_exchange_weak(observedNextMs, nextAllowedMs, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    inline void applyFlushPolicy()
+    {
+        if (_logger) {
+            _logger->flush_on(FLUSH_ON_LEVEL);
+        }
+        if (_rawLogger) {
+            _rawLogger->flush_on(FLUSH_ON_LEVEL);
+        }
+    }
+
     /**
      * Logs at "level" but only one message per "time" milliseconds per format string, other logs are dropped.
      */
@@ -105,14 +179,10 @@ namespace f4cf::logger::internal
         }
 
         const fmt::basic_string_view<char> fmtView = fmt;
-        const std::string_view key(fmtView.data(), fmtView.size());
-
-        const auto now = std::chrono::steady_clock::now();
-        if (_sampleMessagesTtl.contains(key) && now - _sampleMessagesTtl[key] <= std::chrono::milliseconds(time)) {
+        if (!shouldEmitSample(std::string_view(fmtView.data(), fmtView.size()), time)) {
             return;
         }
 
-        _sampleMessagesTtl[key] = now;
         std::string formatted = fmt::format(fmt, std::forward<Args>(args)...);
         const spdlog::source_loc sourceLoc{ loc.file_name(), static_cast<int>(loc.line()), loc.function_name() };
         _logger->log(sourceLoc, level, "[sample] {}", formatted);
@@ -339,6 +409,9 @@ namespace f4cf::logger
     template <class... Args>
     void infoRaw(spdlog::format_string_t<Args...> fmt, Args&&... args)
     {
+        if (!internal::_rawLogger || !internal::_rawLogger->should_log(spdlog::level::info)) {
+            return;
+        }
         internal::_rawLogger->log(spdlog::level::info, fmt, std::forward<Args>(args)...);
     }
 
@@ -360,13 +433,12 @@ namespace f4cf::logger
 
         internal::_logger = std::make_shared<spdlog::logger>("GLOBAL"s, sink);
         internal::_logger->set_level(spdlog::level::info);
-        internal::_logger->flush_on(spdlog::level::info);
         internal::_logger->set_formatter(std::make_unique<internal::HybridFormatter>());
         spdlog::set_default_logger(internal::_logger);
 
         internal::_rawLogger = std::make_shared<spdlog::logger>(std::string(internal::RAW_LOGGER_NAME), sink);
         internal::_rawLogger->set_level(spdlog::level::info);
-        internal::_rawLogger->flush_on(spdlog::level::info);
+        internal::applyFlushPolicy();
     }
 
     /**
@@ -379,10 +451,13 @@ namespace f4cf::logger
             info("Set log level = {} ({})", clampedLogLevel, internal::logLevelName(clampedLogLevel));
             internal::_logLevel = clampedLogLevel;
             const auto levelEnum = static_cast<spdlog::level::level_enum>(clampedLogLevel);
-            internal::_logger->set_level(levelEnum);
-            internal::_logger->flush_on(levelEnum);
-            internal::_rawLogger->set_level(levelEnum);
-            internal::_rawLogger->flush_on(levelEnum);
+            if (internal::_logger) {
+                internal::_logger->set_level(levelEnum);
+            }
+            if (internal::_rawLogger) {
+                internal::_rawLogger->set_level(levelEnum);
+            }
+            internal::applyFlushPolicy();
         }
 
         // see: https://github.com/gabime/spdlog/wiki/Custom-formatting
